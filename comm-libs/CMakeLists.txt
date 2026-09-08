@@ -72,7 +72,7 @@ if(THEROCK_ENABLE_RCCL)
   # is never compiled into librccl.so and the unbundle step fails with
   # "No code objects for architecture 'gfx1250'".
   if(THEROCK_ENABLE_ROCJITSU_HOTSWAP AND THEROCK_FLAG_KPACK_SPLIT_ARTIFACTS
-     AND NOT THEROCK_SANITIZER)
+     AND NOT THEROCK_SANITIZER AND FALSE) # forced off: gfx1250 not built when RCCL is scoped to gfx906 only
     therock_cmake_subproject_dist_dir(_rccl_dist_dir rccl)
     therock_cmake_subproject_dist_dir(_rocjitsu_dist_dir rocjitsu)
     therock_cmake_subproject_dist_dir(_rocjitsu_hotswap_dist_dir rocjitsu-hotswap)
