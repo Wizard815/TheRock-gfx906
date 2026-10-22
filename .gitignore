@@ -37,3 +37,4 @@ build_tools/packaging/windows/artifact-cache/
 build_tools/packaging/windows/*.wxs
 build_tools/packaging/windows/*.msi
 build_tools/packaging/windows/*.wixpdb
+.gfx906-sources-fetched
