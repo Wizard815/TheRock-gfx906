@@ -202,9 +202,9 @@ python build_tools/packaging/python/mirror_python_dependencies.py resolve \
   --output-dir /tmp/rocm-dependency-snapshot
 ```
 
-After configuring normal boto3/AWS credentials with `HeadObject`, `GetObject`,
-`PutObject`, and same-key `CopyObject` access to one destination bucket,
-publish the same local snapshot:
+After configuring normal boto3/AWS credentials with `HeadBucket` (`ListBucket`),
+`HeadObject`, `GetObject`, `PutObject`, and same-key `CopyObject` access to one
+destination bucket, publish the same local snapshot:
 
 ```bash
 python build_tools/packaging/python/mirror_python_dependencies.py publish \
@@ -296,6 +296,7 @@ ROCm Python packaging separates profiling functionality as follows:
 
   - `rocprof-compute`
   - `rocprof-sys-*`
+  - `rocsys`
   - profiler runtime libraries (from `rocprofiler-systems` and `rocprofiler-compute`)
 
 This separation allows you to install profiling tools only when needed.
