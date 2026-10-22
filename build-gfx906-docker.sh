@@ -22,7 +22,7 @@ RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         gfortran git ninja-build cmake g++ pkg-config xxd automake libtool \
         python3-venv python3-dev libegl1-mesa-dev texinfo bison flex \
-        curl make ca-certificates xz-utils jq \
+        curl make ca-certificates xz-utils jq patch \
     && rm -rf /var/lib/apt/lists/*
 COPY install_pinned_patchelf.sh install_patchelf.sh install_ccache.sh \
      build_manylinux_x86_64.Dockerfile /tmp/inst/
