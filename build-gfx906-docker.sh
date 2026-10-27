@@ -9,7 +9,7 @@
 #   ./build-gfx906-docker.sh shell      # interactive shell in the build env
 #
 # Needs ~250GB free here and ~4-8GB RAM per job. Output: build/dist/rocm/ and
-# build/archives/*.tar.xz.
+# build/archives/rocm-gfx906-<version>.tar.xz.
 set -euo pipefail
 
 SRC=$(cd "$(dirname "$0")" && pwd)
@@ -74,6 +74,10 @@ fi
 
 ninja -C build -j"$JOBS"
 ninja -C build artifacts
-ninja -C build archives
-echo "Done: build/dist/rocm/ and build/archives/"
+# TheRock no longer has an `archives` target (CI packs artifacts itself), so
+# pack the unified install tree directly.
+ver=$(python3 -c "import json; print(json.load(open(\"version.json\"))[\"rocm-version\"])")
+mkdir -p build/archives
+tar -C build/dist -cf - rocm | xz -T0 > "build/archives/rocm-gfx906-$ver.tar.xz"
+echo "Done: build/dist/rocm/ and build/archives/rocm-gfx906-$ver.tar.xz"
 '
