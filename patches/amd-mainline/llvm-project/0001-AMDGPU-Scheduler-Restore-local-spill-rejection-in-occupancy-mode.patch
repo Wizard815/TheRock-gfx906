@@ -1,0 +1,252 @@
+From 5eaa4e7e0d68473f80c7f6ee854811015769c6de Mon Sep 17 00:00:00 2001
+From: leeliu103 <liliu103@amd.com>
+Date: Fri, 23 Oct 2026 19:49:17 -0400
+Subject: [PATCH] [AMDGPU][Scheduler] Restore local spill rejection in
+ occupancy mode (#233979)
+
+When rematerializing for higher occupancy, the scheduler can retain a
+schedule that introduces spills even when the saved order is spill-free.
+The `!TargetOcc` guard disables local spill rejection. Since occupancy
+is tracked using `max(WavesBefore, WavesAfter)`, global finalization can
+still consider the target reached even when the trial schedule is worse.
+
+The guard was introduced in 7cc7a9412893 (#180646) alongside a fix for
+rollback using temporary `DBG_VALUE` placeholders. dc34d163d8c9
+(#192443) replaced that representation with the shared MIR
+rematerializer, removing the placeholder-specific slot-index issue.
+
+Re-enable the existing `mayCauseSpilling` check in occupancy mode to
+reject such trials and restore the instruction order saved before
+rescheduling, while preserving rematerialization. Global finalization
+still handles rematerialization rollback. Add a MIR regression that
+spills before the fix and remains spill-free afterward.
+
+Related Q2_K spilling discussion:
+https://github.com/ggml-org/llama.cpp/pull/29910
+
+---------
+
+Co-authored-by: leeliu103 <211733494+leeliu103@users.noreply.github.com>
+---
+ llvm/lib/Target/AMDGPU/GCNSchedStrategy.cpp   |  5 +-
+ ...ne-scheduler-rematerialization-scoring.mir |  2 +-
+ ...e-scheduler-sink-trivial-remats-spills.mir | 61 +++++++++++++++++++
+ .../machine-scheduler-sink-trivial-remats.mir | 22 +++----
+ 4 files changed, 75 insertions(+), 15 deletions(-)
+ create mode 100644 llvm/test/CodeGen/AMDGPU/machine-scheduler-sink-trivial-remats-spills.mir
+
+diff --git a/llvm/lib/Target/AMDGPU/GCNSchedStrategy.cpp b/llvm/lib/Target/AMDGPU/GCNSchedStrategy.cpp
+index 057c72d96..b47fabb60 100644
+--- a/llvm/lib/Target/AMDGPU/GCNSchedStrategy.cpp
++++ b/llvm/lib/Target/AMDGPU/GCNSchedStrategy.cpp
+@@ -2245,9 +2245,8 @@ bool ClusteredLowOccStage::shouldRevertScheduling(unsigned WavesAfter) {
+ }
+ 
+ bool PreRARematStage::shouldRevertScheduling(unsigned WavesAfter) {
+-  // When trying to increase occupancy (TargetOcc == true) the stage manages
+-  // region reverts globally (all or none), so we always return false here.
+-  return !TargetOcc && mayCauseSpilling(WavesAfter);
++  return GCNSchedStage::shouldRevertScheduling(WavesAfter) ||
++         mayCauseSpilling(WavesAfter);
+ }
+ 
+ bool ILPInitialScheduleStage::shouldRevertScheduling(unsigned WavesAfter) {
+diff --git a/llvm/test/CodeGen/AMDGPU/machine-scheduler-rematerialization-scoring.mir b/llvm/test/CodeGen/AMDGPU/machine-scheduler-rematerialization-scoring.mir
+index 2abcb4697..ea0aed21b 100644
+--- a/llvm/test/CodeGen/AMDGPU/machine-scheduler-rematerialization-scoring.mir
++++ b/llvm/test/CodeGen/AMDGPU/machine-scheduler-rematerialization-scoring.mir
+@@ -432,8 +432,8 @@ body:             |
+   ; CHECK-NEXT:   [[V_CVT_I32_F64_e32_29:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 5, implicit $exec, implicit $mode
+   ; CHECK-NEXT:   [[V_CVT_I32_F64_e32_30:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 6, implicit $exec, implicit $mode
+   ; CHECK-NEXT:   [[V_CVT_I32_F64_e32_31:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 7, implicit $exec, implicit $mode
+-  ; CHECK-NEXT:   [[V_CVT_I32_F64_e32_32:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 8, implicit $exec, implicit $mode
+   ; CHECK-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_24]], implicit [[V_CVT_I32_F64_e32_25]], implicit [[V_CVT_I32_F64_e32_26]], implicit [[V_CVT_I32_F64_e32_27]], implicit [[V_CVT_I32_F64_e32_28]], implicit [[V_CVT_I32_F64_e32_29]], implicit [[V_CVT_I32_F64_e32_30]], implicit [[V_CVT_I32_F64_e32_31]]
++  ; CHECK-NEXT:   [[V_CVT_I32_F64_e32_32:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 8, implicit $exec, implicit $mode
+   ; CHECK-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_32]], implicit [[V_CVT_I32_F64_e32_]], implicit [[V_CVT_I32_F64_e32_1]], implicit [[V_CVT_I32_F64_e32_2]], implicit [[V_CVT_I32_F64_e32_3]], implicit [[V_CVT_I32_F64_e32_4]], implicit [[V_CVT_I32_F64_e32_5]], implicit [[V_CVT_I32_F64_e32_6]]
+   ; CHECK-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_7]], implicit [[V_CVT_I32_F64_e32_8]], implicit [[V_CVT_I32_F64_e32_9]], implicit [[V_CVT_I32_F64_e32_10]], implicit [[V_CVT_I32_F64_e32_11]], implicit [[V_CVT_I32_F64_e32_12]], implicit [[V_CVT_I32_F64_e32_13]], implicit [[V_CVT_I32_F64_e32_14]]
+   ; CHECK-NEXT:   S_BRANCH %bb.1
+diff --git a/llvm/test/CodeGen/AMDGPU/machine-scheduler-sink-trivial-remats-spills.mir b/llvm/test/CodeGen/AMDGPU/machine-scheduler-sink-trivial-remats-spills.mir
+new file mode 100644
+index 000000000..52c5e6454
+--- /dev/null
++++ b/llvm/test/CodeGen/AMDGPU/machine-scheduler-sink-trivial-remats-spills.mir
+@@ -0,0 +1,61 @@
++# RUN: llc -mtriple=amdgpu9.00-amd-amdhsa -start-before=machine-scheduler -stop-after=greedy,2 -o - %s | FileCheck %s
++
++# Check that rematerialization for higher occupancy does not introduce spills.
++
++--- |
++  define amdgpu_kernel void @remat_occupancy_no_spill() #0 {
++    ret void
++  }
++
++  attributes #0 = { "amdgpu-waves-per-eu"="9,10" }
++...
++---
++name:            remat_occupancy_no_spill
++tracksRegLiveness: true
++machineFunctionInfo:
++  isEntryFunction: true
++  stackPtrOffsetReg: '$sgpr32'
++body:             |
++  ; CHECK-LABEL: name: remat_occupancy_no_spill
++  ; CHECK: bb.0:
++  ; CHECK-NEXT:   successors: %bb.1(0x80000000)
++  ; CHECK-NEXT: {{  $}}
++  ; CHECK-NEXT:   S_NOP 0, implicit-def %live16, implicit-def %live2
++  ; CHECK-NEXT:   %loaded:vreg_64 = DS_READ2_B32_gfx9 %live2.sub0, 0, 1, 0, implicit $exec :: (load (s64), align 4, addrspace 3)
++  ; CHECK-NEXT: {{  $}}
++  ; CHECK-NEXT: bb.1:
++  ; CHECK-NEXT:   successors: %bb.2(0x80000000)
++  ; CHECK-NEXT: {{  $}}
++  ; CHECK-NEXT:   %value0:vreg_128 = GLOBAL_LOAD_DWORDX4 %loaded, 0, 0, implicit $exec :: (load (s128), addrspace 1)
++  ; CHECK-NEXT:   DS_WRITE_B128_gfx9 %live2.sub0, %value0, 32, 0, implicit $exec :: (store (s128), addrspace 3)
++  ; CHECK-NEXT:   %value1:vreg_128 = GLOBAL_LOAD_DWORDX4 %loaded, 16, 0, implicit $exec :: (load (s128), addrspace 1)
++  ; CHECK-NEXT:   DS_WRITE_B128_gfx9 %live2.sub0, %value1, 48, 0, implicit $exec :: (store (s128), addrspace 3)
++  ; CHECK-NEXT:   [[V_ADD_U32_e64_:%[0-9]+]]:vgpr_32 = V_ADD_U32_e64 16, %live2.sub0, 0, implicit $exec
++  ; CHECK-NEXT:   DS_WRITE_B32_gfx9 [[V_ADD_U32_e64_]], %loaded.sub0, 0, 0, implicit $exec :: (store (s32), addrspace 3)
++  ; CHECK-NEXT:   DS_WRITE_B32_gfx9 [[V_ADD_U32_e64_]], %loaded.sub1, 4, 0, implicit $exec :: (store (s32), addrspace 3)
++  ; CHECK-NEXT: {{  $}}
++  ; CHECK-NEXT: bb.2:
++  ; CHECK-NEXT:   S_NOP 0, implicit %live16, implicit %live2, implicit %loaded
++  ; CHECK-NEXT:   S_ENDPGM 0
++  bb.0:
++    successors: %bb.1
++
++    S_NOP 0, implicit-def %live16:vreg_512, implicit-def %live2:vreg_64
++    %loaded:vreg_64 = DS_READ2_B32_gfx9 %live2.sub0, 0, 1, 0, implicit $exec :: (load (s64), align 4, addrspace 3)
++    %address:vgpr_32 = V_ADD_U32_e64 16, %live2.sub0, 0, implicit $exec
++
++  bb.1:
++    successors: %bb.2
++
++    %value0:vreg_128 = GLOBAL_LOAD_DWORDX4 %loaded, 0, 0, implicit $exec :: (load (s128), addrspace 1)
++    DS_WRITE_B128_gfx9 %live2.sub0, %value0, 32, 0, implicit $exec :: (store (s128), addrspace 3)
++
++    %value1:vreg_128 = GLOBAL_LOAD_DWORDX4 %loaded, 16, 0, implicit $exec :: (load (s128), addrspace 1)
++    DS_WRITE_B128_gfx9 %live2.sub0, %value1, 48, 0, implicit $exec :: (store (s128), addrspace 3)
++    DS_WRITE_B32_gfx9 %address, %loaded.sub0, 0, 0, implicit $exec :: (store (s32), addrspace 3)
++    DS_WRITE_B32_gfx9 %address, %loaded.sub1, 4, 0, implicit $exec :: (store (s32), addrspace 3)
++
++  bb.2:
++    S_NOP 0, implicit %live16, implicit %live2, implicit %loaded
++    S_ENDPGM 0
++...
+diff --git a/llvm/test/CodeGen/AMDGPU/machine-scheduler-sink-trivial-remats.mir b/llvm/test/CodeGen/AMDGPU/machine-scheduler-sink-trivial-remats.mir
+index 4f74dbfe3..57055c0bb 100644
+--- a/llvm/test/CodeGen/AMDGPU/machine-scheduler-sink-trivial-remats.mir
++++ b/llvm/test/CodeGen/AMDGPU/machine-scheduler-sink-trivial-remats.mir
+@@ -352,8 +352,8 @@ body:             |
+   ; GFX908-NEXT:   successors: %bb.2(0x80000000)
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_23:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 24, implicit $exec, implicit $mode, implicit-def $m0
+-  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_24:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 23, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_23]]
++  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_24:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 23, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_24]]
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT: bb.2:
+@@ -510,8 +510,8 @@ body:             |
+   ; GFX908-NEXT:   successors: %bb.2(0x80000000)
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_23:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 24, implicit $exec, implicit $mode, implicit-def $m0
+-  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_24:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 22, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_23]]
++  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_24:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 22, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_24]], implicit [[V_CVT_I32_F64_e32_22]]
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT: bb.2:
+@@ -665,8 +665,8 @@ body:             |
+   ; GFX908-NEXT:   successors: %bb.2(0x80000000)
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_23:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 24, implicit $exec, implicit $mode, implicit-def $m0
+-  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_24:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 23, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_23]]
++  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_24:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 23, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_24]]
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT: bb.2:
+@@ -678,8 +678,8 @@ body:             |
+   ; GFX908-NEXT:   successors: %bb.4(0x80000000)
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_25:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 26, implicit $exec, implicit $mode, implicit-def $m0
+-  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_26:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 25, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_25]]
++  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_26:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 25, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_26]]
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT: bb.4:
+@@ -861,9 +861,9 @@ body:             |
+   ; GFX908-NEXT:   successors: %bb.2(0x80000000)
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_22:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 24, implicit $exec, implicit $mode, implicit-def $m0
++  ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_22]]
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_23:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 22, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_24:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 23, implicit $exec, implicit $mode
+-  ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_22]]
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_24]], implicit [[V_CVT_I32_F64_e32_23]]
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT: bb.2:
+@@ -876,8 +876,8 @@ body:             |
+   ; GFX908-NEXT:   successors: %bb.4(0x80000000)
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_26:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 27, implicit $exec, implicit $mode, implicit-def $m0
+-  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_27:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 25, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_26]]
++  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_27:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 25, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_27]], implicit [[V_CVT_I32_F64_e32_25]]
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT: bb.4:
+@@ -4426,8 +4426,8 @@ body:             |
+   ; GFX908-NEXT:   successors: %bb.3(0x80000000)
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_27:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 28, implicit $exec, implicit $mode, implicit-def $m0
+-  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_28:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 27, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_27]]
++  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_28:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 27, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_28]]
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT: bb.3:
+@@ -4691,8 +4691,8 @@ body:             |
+   ; GFX908-NEXT:   successors: %bb.3(0x80000000)
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_31:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 32, implicit $exec, implicit $mode, implicit-def $m0
+-  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_32:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 31, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_31]]
++  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_32:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 31, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_32]]
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT: bb.3:
+@@ -4974,8 +4974,8 @@ body:             |
+   ; GFX908-NEXT:   successors: %bb.3(0x80000000)
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_35:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 36, implicit $exec, implicit $mode, implicit-def $m0
+-  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_36:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 35, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_35]]
++  ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_36:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 35, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_36]]
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT: bb.3:
+@@ -8607,8 +8607,8 @@ body:             |
+   ; GFX908-NEXT:   successors: %bb.2(0x80000000)
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_22:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 23, implicit $exec, implicit $mode, implicit-def $m0
+-  ; GFX908-NEXT:   [[V_CVT_F64_I32_e32_:%[0-9]+]]:vreg_64 = nofpexcept V_CVT_F64_I32_e32 22, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_22]]
++  ; GFX908-NEXT:   [[V_CVT_F64_I32_e32_:%[0-9]+]]:vreg_64 = nofpexcept V_CVT_F64_I32_e32 22, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_F64_I32_e32_]]
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT: bb.2:
+@@ -8760,8 +8760,8 @@ body:             |
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_22:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 23, implicit $exec, implicit $mode, implicit-def $m0
+   ; GFX908-NEXT:   [[V_CVT_I32_F64_e32_23:%[0-9]+]]:vgpr_32 = nofpexcept V_CVT_I32_F64_e32 24, implicit $exec, implicit $mode, implicit-def $m0
+-  ; GFX908-NEXT:   [[V_CVT_F64_I32_e32_:%[0-9]+]]:vreg_64 = nofpexcept V_CVT_F64_I32_e32 22, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_I32_F64_e32_22]], implicit [[V_CVT_I32_F64_e32_23]]
++  ; GFX908-NEXT:   [[V_CVT_F64_I32_e32_:%[0-9]+]]:vreg_64 = nofpexcept V_CVT_F64_I32_e32 22, implicit $exec, implicit $mode
+   ; GFX908-NEXT:   S_NOP 0, implicit [[V_CVT_F64_I32_e32_]]
+   ; GFX908-NEXT: {{  $}}
+   ; GFX908-NEXT: bb.2:
+-- 
+2.43.0
+
