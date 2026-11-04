@@ -60,16 +60,25 @@ fi
 
 # gfx906 compiler patches added after the first fetch: apply any not applied
 # yet to an existing amd-llvm tree (fetch_sources.py applies them on a fresh one).
-# The touched LLVM files make ninja rebuild amd-llvm and everything after it.
+# git am strips leading "[...]" tags from the subject (e.g. "[AMDGPU][Scheduler]"),
+# so match on the subject without them. amd-llvm is stamp-gated: changed sources
+# alone do not rebuild it, so drop its build/stage stamps after applying, which
+# rebuilds the compiler and every sub-project staged from it.
+llvm_patched=0
 for p in patches/amd-mainline/llvm-project/*.patch; do
     [ -e "$p" ] || continue
-    subj="$(sed -n "s/^Subject: \[PATCH\] //p" "$p" | head -1)"
-    if [ -z "$(git -C compiler/amd-llvm log --format=%h -n 200 -F --grep="${subj:0:60}")" ]; then
+    subj="$(sed -n "s/^Subject: \[PATCH[^]]*\] *//p" "$p" | head -1 | sed -E "s/^(\[[^]]*\] *)+//")"
+    if [ -z "$(git -C compiler/amd-llvm log --format=%h -n 200 -F --grep="${subj:0:50}")" ]; then
         echo "applying $(basename "$p") to compiler/amd-llvm"
         git -C compiler/amd-llvm -c user.name=therockbot -c user.email=therockbot@amd.com \
             am --whitespace=nowarn --no-gpg-sign "$PWD/$p"
+        llvm_patched=1
     fi
 done
+if [ "$llvm_patched" = 1 ] && [ -d build/compiler/amd-llvm/stamp ]; then
+    echo "amd-llvm patched: removing its build/stage stamps to force a rebuild"
+    rm -f build/compiler/amd-llvm/stamp/build.stamp build/compiler/amd-llvm/stamp/stage.stamp
+fi
 
 eval "$(./build_tools/setup_ccache.py)"
 
