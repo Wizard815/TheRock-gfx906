@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+r"""Upload a built amd-repo-setup package to the per-run outputs.
+
+Not to be confused with ``upload_package_repo.py``, which uploads the package
+repository itself (the content packages and their index).
+
+The package keeps the file name the builder gave it and goes to one folder per
+distro, because each amd-repo-setup package is built for one distro (its
+repository file names that distro). The ROCm packages differ: they are built
+once per format and stored under `deb/` and `rpm/`.
+
+    {run_id}-linux/amd-repo-setup/<os_profile>/<file>    (run's artifacts bucket)
+    v5/amd-repo-setup/<os_profile>/<file>                (after publish_rocm_to_release_buckets.py)
+
+e.g. `12345-linux/amd-repo-setup/rhel10/amd-repo-setup-10.1.0~rc3-1.rc.el10.noarch.rpm`
+and `12345-linux/amd-repo-setup/ubuntu2404/amd-repo-setup_10.1.0~20261105-12345~ubuntu2404_all.deb`.
+
+The bucket and prefix come from the CI environment: ``GITHUB_REPOSITORY``,
+``RELEASE_TYPE`` and the event payload used for fork detection. The ``release``
+line has no artifacts bucket and raises; the upload job does not run for it.
+
+Usage:
+  python build_tools/packaging/linux/upload_repo_setup_package.py \
+      --dest-dir repo-setup-package-out \
+      --run-id 12345678901 \
+      --os-profile rhel10 \
+      --pkg-type rpm
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+_THIS_DIR = Path(__file__).resolve().parent
+_BUILD_TOOLS_DIR = _THIS_DIR.parent.parent
+
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
+if str(_BUILD_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_BUILD_TOOLS_DIR))
+
+from _therock_utils.storage_backend import create_storage_backend
+from _therock_utils.workflow_outputs import WorkflowOutputRoot
+from github_actions.github_actions_api import gha_set_output
+
+# An os-profile becomes a path segment of the object key. The leading
+# alphanumeric rejects "." and "..", which would escape a local staging
+# directory. \Z (not $) so a trailing newline is not accepted.
+_OS_PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+# A workflow run id is always numeric, and it becomes the leading path segment
+# of the object key via WorkflowOutputRoot.prefix. Unconstrained, a value such
+# as "../.." escapes the destination once the key is joined onto a local
+# staging directory. \Z (not $) so a trailing newline is not accepted.
+_RUN_ID_RE = re.compile(r"^[0-9]+\Z")
+
+# The file name goes into the object key and $GITHUB_OUTPUT, so only the
+# characters the builder's names use are allowed (\Z rejects a trailing newline).
+_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~+-]*\Z")
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Upload an amd-repo-setup package to the per-run outputs.",
+    )
+    p.add_argument(
+        "--dest-dir",
+        required=True,
+        type=Path,
+        help="Builder output directory holding exactly one built package",
+    )
+    p.add_argument(
+        "--run-id",
+        required=True,
+        help="GitHub Actions workflow run ID, which selects the per-run prefix",
+    )
+    p.add_argument(
+        "--os-profile", required=True, help="Target distro profile (path segment)"
+    )
+    p.add_argument(
+        "--pkg-type",
+        required=True,
+        choices=["deb", "rpm"],
+        help="Package type, used to find the built package",
+    )
+    p.add_argument(
+        "--output-dir",
+        default=None,
+        type=Path,
+        help="Stage into this local directory instead of uploading to S3",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Log the destination without writing anything",
+    )
+    args = p.parse_args(argv)
+    if not _RUN_ID_RE.match(args.run_id):
+        p.error(f"--run-id must be numeric: {args.run_id!r}")
+    if not _OS_PROFILE_RE.match(args.os_profile):
+        p.error(f"--os-profile has an unexpected format: {args.os_profile!r}")
+    if not args.dest_dir.is_dir():
+        p.error(f"--dest-dir is not a directory: {args.dest_dir}")
+    return args
+
+
+def find_package(dest_dir: Path, pkg_type: str) -> Path:
+    """Return the single built package in ``dest_dir``.
+
+    One build produces one package, so anything other than exactly one match is
+    an error rather than a guess about which file to upload.
+    """
+    built = sorted(dest_dir.glob(f"*.{pkg_type}"))
+    if len(built) != 1:
+        raise ValueError(
+            f"expected exactly one .{pkg_type} in {dest_dir}, found {len(built)}"
+        )
+    return built[0]
+
+
+def upload(args: argparse.Namespace) -> str:
+    """Upload the built package to its per-run location. Returns the object key.
+
+    After an upload to S3, the package's https URL is written to
+    ``$GITHUB_OUTPUT`` as ``repo_setup_package_url``. A dry run or a local
+    staging run uploads nothing there, so it writes no output.
+    """
+    package = find_package(args.dest_dir, args.pkg_type)
+    if not _FILENAME_RE.match(package.name):
+        raise ValueError(f"built package has an unexpected file name: {package.name!r}")
+    root = WorkflowOutputRoot.from_workflow_run(run_id=args.run_id, platform="linux")
+    dest = root.repo_setup_package(args.os_profile, package.name)
+    backend = create_storage_backend(staging_dir=args.output_dir, dry_run=args.dry_run)
+    # Log where the file actually goes: with --output-dir that is a local path,
+    # and an s3:// URI would describe an upload that did not happen.
+    target = (
+        dest.local_path(args.output_dir) if args.output_dir is not None else dest.s3_uri
+    )
+    action = "[DRY RUN] Would upload" if args.dry_run else "Uploading"
+    print(f"{action} {package} -> {target}")
+    backend.upload_file(package, dest)
+    if not args.dry_run:
+        print(f"Uploaded: {target}")
+        if args.output_dir is None:
+            gha_set_output({"repo_setup_package_url": dest.https_url})
+    return dest.relative_path
+
+
+def main(argv=None) -> None:
+    upload(parse_args(argv))
+
+
+if __name__ == "__main__":
+    main()

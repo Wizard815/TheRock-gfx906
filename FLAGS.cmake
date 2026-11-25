@@ -77,6 +77,21 @@ therock_declare_flag(
     hipkernelprovider
 )
 
+# FlyDSL's prebuilt kernels for the hip-kernel-provider's kernel ingestor
+# (rocm-libraries dnn-providers/hip-kernel-provider/flydsl/). The option is OFF
+# in rocm-libraries; this flag turns it on, and turning the flag off is how
+# TheRock switches FlyDSL off. Takes effect only with
+# HIPDNN_ENABLE_KERNEL_INGESTOR.
+therock_declare_flag(
+  NAME HIPKERNELPROVIDER_ENABLE_FLYDSL
+  DEFAULT_VALUE ON
+  DESCRIPTION "Pack the prebuilt FlyDSL kernels for the hip-kernel-provider's kernel ingestor"
+  CMAKE_VARS
+    HIPKERNELPROVIDER_ENABLE_FLYDSL=ON
+  SUB_PROJECTS
+    hipkernelprovider
+)
+
 # Gates the generic kernel ingestor platform described in RFC 0017:
 # rocm-libraries/projects/hipdnn/docs/rfcs/0017_UniversalKernelDescriptor.md
 therock_declare_flag(
@@ -92,7 +107,7 @@ therock_declare_flag(
 
 therock_declare_flag(
   NAME MIOPEN_ENABLE_HIPDNN_WRAPPER
-  DEFAULT_VALUE OFF
+  DEFAULT_VALUE ON
   DESCRIPTION "Build MIOpen as a public wrapper (libMIOpen.so) over a private implementation library (libMIOpen_private.so), with optional runtime forwarding to hipDNN. See rocm-libraries MIOpen RFC 0001."
   CMAKE_VARS
     MIOPEN_ENABLE_HIPDNN_WRAPPER=ON
@@ -124,29 +139,6 @@ therock_declare_flag(
   DESCRIPTION "Include experimental HRX runtime in core-runtime"
 )
 
-# Autotools is only available on Linux. Default OFF elsewhere so configure
-# does not warn about a flag that platform cannot honor.
-set(_fftw3_autotools_default OFF)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(_fftw3_autotools_default ON)
-endif()
-
-therock_declare_flag(
-  NAME FFTW3_AUTOTOOLS_BUILD
-  DEFAULT_VALUE ${_fftw3_autotools_default}
-  DESCRIPTION "Build third-party fftw3 with autotools on Linux. Ignored on Windows."
-)
-
-therock_declare_flag(
-  NAME HSA_HOTSWAP_DEFAULT_ON
-  DEFAULT_VALUE ON
-  DESCRIPTION "Enable automatic ROCr hotswap loading by default when HSA_HOTSWAP_ENABLE is unset"
-  CPP_DEFINES
-    HSA_HOTSWAP_DEFAULT_ON=1
-  SUB_PROJECTS
-    ROCR-Runtime
-)
-
 therock_declare_flag(
   NAME HSA_WINDOWS_SHARED_RUNTIME
   DEFAULT_VALUE OFF
@@ -169,6 +161,24 @@ therock_declare_flag(
   DEFAULT_VALUE OFF
   DESCRIPTION "Windows: build for the AMD driver package"
   GLOBAL_PROPAGATE_FLAG
+)
+
+# RFC0018 flag metadata (recorded here as a comment until therock_declare_flag
+# grows dedicated OWNER/CREATED/EXPIRES/STAGE keywords; see
+# docs/rfcs/RFC0018-Feature-Flag-Lifecycle-and-Canary-Promotion.md):
+#   OWNER    prim-team
+#   CREATED  2026-10-21
+#   EXPIRES  2027-04-21
+#   STAGE    default-on
+# Build-time flag: changes build topology, install layout and artifacts, so it
+# cannot be a runtime flag. ON builds the unified hipCCL superbuild; OFF is the
+# kill switch back to the legacy separate subprojects (no PR revert needed).
+therock_declare_flag(
+  NAME BUILD_HIPCCL
+  TYPE BOOL
+  DEFAULT_VALUE ON
+  DESCRIPTION "Build rocPRIM/hipCUB/rocThrust together as the unified hipCCL superbuild (rocm-libraries projects/hipccl/hipccl3) instead of the legacy separate subprojects. OFF builds the legacy subprojects."
+  ISSUE AIPRIMS-251
 )
 
 ###############################################################################
