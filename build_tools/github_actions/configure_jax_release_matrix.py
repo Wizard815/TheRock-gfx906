@@ -30,6 +30,12 @@ CI_PYTHON_VERSIONS = {
     "linux": ["3.12"],
 }
 
+# Every ref builds in this image; the build installs the run's ROCm into it.
+# Upstream main's hermetic clang needs glibc >= 2.34 and GLIBCXX_3.4.30 to run,
+# which the existing manylinux_2_28 image cannot satisfy. The wheels still
+# target the hermetic toolchain's linux_glibc_2_27 sysroot, not the image's glibc.
+JAX_BUILD_IMAGE = "ghcr.io/rocm/jax-build-ubu24.rocmless@sha256:fe966c6f77ad7dcd279bad02833d4cd70f72a9cd87640912ae37b20b3de7edea"
+
 JAX_REF_CONFIGS = {
     "rocm-jaxlib-v0.10.2": {
         "jax_ref": "rocm-jaxlib-v0.10.2",
@@ -57,12 +63,18 @@ JAX_REF_CONFIGS = {
         # JAX dropped Python 3.11 support in 0.11.0.
         "exclude_python_versions": ["3.11"],
     },
+    "rocm-jaxlib-v0.12.0": {
+        "jax_ref": "rocm-jaxlib-v0.12.0",
+        "jax_repository": "ROCm/jax",
+        "gfx_arch": "device-all",
+        # JAX dropped Python 3.11 support in 0.11.0.
+        "exclude_python_versions": ["3.11"],
+    },
     # Upstream JAX at its moving tip, built against the ROCm of the same run
     # (tip vs tip), the way PyTorch's "nightly" ref is a row of its release
-    # matrix. Release types other than prerelease include it (RELEASE_JAX_REFS).
-    # The manylinux Dockerfile comes from rocm-jax's default branch, since
-    # rocm-jax has no ref named "main" and the Dockerfile has no JAX-version
-    # coupling.
+    # matrix.
+    # The tests check out rocm-jax at its default branch, since rocm-jax has no
+    # ref named "main".
     "jax-main": {
         "jax_ref": "main",
         "jax_repository": "jax-ml/jax",
@@ -88,10 +100,11 @@ RELEASE_STABLE_JAX_REFS = {
         "rocm-jaxlib-v0.11.0",
         "rocm-jaxlib-v0.11.1",
         "rocm-jaxlib-v0.11.2",
+        "rocm-jaxlib-v0.12.0",
     ],
 }
 
-# Refs for the other release types: stable refs + upstream tip.
+# Refs for "dev" and "nightly" releases: stable refs + upstream tip.
 RELEASE_JAX_REFS = {
     platform: [*refs, "jax-main"] for platform, refs in RELEASE_STABLE_JAX_REFS.items()
 }
@@ -101,7 +114,7 @@ RELEASE_JAX_REFS = {
 # rather than every release version. Additional refs can be opted in as needed.
 CI_JAX_REFS = {
     "linux": [
-        "rocm-jaxlib-v0.11.2",
+        "rocm-jaxlib-v0.12.0",
     ],
 }
 
@@ -155,11 +168,12 @@ def generate_jax_matrix(
                         "jax_label", ref_cfg["jax_ref"].removeprefix("rocm-jaxlib-v")
                     ),
                     "jax_repository": ref_cfg["jax_repository"],
-                    # The ROCm/rocm-jax ref holding the manylinux Dockerfile. A
-                    # release tag exists under the same name in both
-                    # repositories, so this defaults to jax_ref.
+                    # The ROCm/rocm-jax ref the tests check out. A release tag
+                    # exists under the same name in both repositories, so this
+                    # defaults to jax_ref.
                     "rocm_jax_ref": ref_cfg.get("rocm_jax_ref", ref_cfg["jax_ref"]),
-                    # gfx_arch selects the ROCm device package for the manylinux
+                    "build_image": JAX_BUILD_IMAGE,
+                    # gfx_arch selects the ROCm device package for the JAX
                     # build (e.g. device-all). This direct lookup raises
                     # KeyError if JAX_REF_CONFIGS omits the key.
                     "gfx_arch": ref_cfg["gfx_arch"],
@@ -186,6 +200,11 @@ def generate_jax_matrix_for_release_type(
         raise ValueError(f"Unknown release_type: {release_type!r}")
     if platform not in ["linux"]:
         raise ValueError(f"Unknown platform: {platform!r}")
+
+    # JAX is not supported for BKC releases today, so return an empty matrix.
+    # See https://github.com/ROCm/rockrel/issues/88 for context.
+    if release_type in ("dev-bkc", "nightly-bkc"):
+        return []
 
     versions = python_versions or _default_python_versions(
         release_type=release_type,
