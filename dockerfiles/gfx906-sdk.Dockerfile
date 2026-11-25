@@ -26,5 +26,10 @@ ENV ROCM_PATH=/opt/rocm \
 RUN test -x /opt/rocm/bin/hipcc && test -d /opt/rocm/lib/rocblas/library/gfx906 \
     && echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf && ldconfig
 
+# Base image for building mx-llama.cpp / whisper.cpp on top: downstream
+# Dockerfiles install packages, so it stays root (same as upstream's images).
+# trivy:ignore:DS-0002
+USER root
+
 LABEL org.opencontainers.image.description="gfx906 ROCm SDK built from Wizard815/TheRock-gfx906" \
       org.opencontainers.image.source="https://github.com/Wizard815/TheRock-gfx906"
