@@ -6,11 +6,12 @@
 """Computes a ROCm package version with an appropriate suffix for a given release type.
 
 For usage from other Python scripts, call the `compute_version()` function
-directly. When used from GitHub Actions, this writes all three version outputs
-to GITHUB_OUTPUT:
+directly. When used from GitHub Actions, this writes all version outputs to
+GITHUB_OUTPUT:
   - 'rocm_package_version' for wheel packages
   - 'rocm_deb_package_version' for deb packages
   - 'rocm_rpm_package_version' for rpm packages
+  - 'rocm_msi_package_version' for Windows MSI packages
 
 Sample usage:
 
@@ -18,6 +19,7 @@ Sample usage:
   # rocm_package_version=7.10.0.dev0+f689a8ea40232f3f6be1ec958354b108349023ff
   # rocm_deb_package_version=7.10.0~dev20251203
   # rocm_rpm_package_version=7.10.0~20251203gf689a8e
+  # rocm_msi_package_version=7.10.3929.0   (major.minor.<days-since-2016-04-01>.0)
 
   python compute_rocm_package_version.py --release-type=prerelease --prerelease-version=2
   # rocm_package_version=7.10.0rc2
@@ -64,7 +66,7 @@ Sample usage:
 
 import argparse
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 import json
 import os
@@ -76,6 +78,16 @@ from github_actions.github_actions_api import *
 
 THIS_SCRIPT_DIR = Path(__file__).resolve().parent
 THEROCK_DIR = THIS_SCRIPT_DIR.parent
+
+# Epoch for the MSI ProductVersion build field: the first ROCm release (ROCm 1.0,
+# April 2016). The MSI version's third field is the number of days since this
+# date, giving a strictly increasing, WiX-legal integer. See compute_msi_build_field.
+MSI_EPOCH = date(2016, 4, 1)
+
+# Windows Installer compares only the first three ProductVersion fields and caps
+# the third (build) field at 65535. days-since-MSI_EPOCH stays under this until
+# ~year 2195, after which a build would raise rather than silently wrap.
+MSI_BUILD_FIELD_MAX = 65535
 
 
 def _log(*args, **kwargs):
@@ -158,6 +170,27 @@ def get_current_date():
     return datetime.today().strftime("%Y%m%d")
 
 
+def compute_msi_build_field(today: date | None = None) -> int:
+    """Return the MSI ProductVersion build field: days since MSI_EPOCH.
+
+    This is the third field of the four-field MSI version. It increases by one
+    per day, so a later build always outranks an earlier one within its
+    major.minor line (Windows Installer compares only the first three fields).
+    Raises if it would exceed the installer's 65535 limit.
+    """
+    if today is None:
+        today = date.today()
+    days = (today - MSI_EPOCH).days
+    if days < 0:
+        raise ValueError(f"build date {today} precedes the MSI epoch {MSI_EPOCH}")
+    if days > MSI_BUILD_FIELD_MAX:
+        raise ValueError(
+            f"MSI build field {days} exceeds the Windows Installer limit of "
+            f"{MSI_BUILD_FIELD_MAX} (third ProductVersion field)"
+        )
+    return days
+
+
 def compute_version(
     package_type: str = "wheel",
     release_type: str | None = None,
@@ -167,11 +200,12 @@ def compute_version(
     override_base_version: str | None = None,
     override_git_sha: str | None = None,
     version_data: Mapping[str, Any] | None = None,
+    build_date: str | None = None,
 ) -> str:
     """Compute package version based on package type and release type.
 
     Args:
-        package_type: Type of package ("wheel", "deb", or "rpm")
+        package_type: Type of package ("wheel", "deb", "rpm", or "msi")
         release_type: Release type ("ci", "dev", "dev-bkc", "nightly",
             "nightly-bkc", "prerelease", or "release")
         build_variant: Build variant (e.g., "release", "asan", "asan-debug",
@@ -183,6 +217,7 @@ def compute_version(
         override_git_sha: Explicit git SHA override, forwarded to get_git_sha().
             See get_git_sha() for details on when this is needed.
         version_data: Contents of version.json. Loaded automatically when required.
+        build_date: Build date as YYYYMMDD. Defaults to today.
 
     Returns:
         Computed version string appropriate for the package type
@@ -198,7 +233,7 @@ def compute_version(
             raise ValueError("rocm-version must be set in version.json")
     _log(f"Base version  : '{base_version}'")
     _log(f"Package type  : '{package_type}'")
-    current_date = get_current_date()
+    current_date = build_date or get_current_date()
 
     if release_type in ("dev-bkc", "nightly-bkc"):
         release_metadata = version_data.get("release-metadata", {})
@@ -265,8 +300,8 @@ def compute_version(
 
         return rocm_package_version
 
-    # Handle native packages (deb/rpm)
-    else:  # package_type in ["deb", "rpm"]
+    # Handle native Linux packages (deb/rpm)
+    elif package_type in ("deb", "rpm"):
         if custom_version_suffix:
             # Custom suffix uses the provided value
             version_suffix_str = f"{custom_version_suffix}"
@@ -307,6 +342,38 @@ def compute_version(
         _log(f"Full version  : '{rocm_package_version}'")
 
         return rocm_package_version
+
+    # Handle native Windows packages (MSI; WiX ProductVersion: numeric
+    # major.minor.build.0).
+    #
+    # Unlike the other package types, the MSI version does NOT carry a dev/nightly
+    # suffix: Windows Installer versions must be numeric #.#.#.# and it compares
+    # only the first three fields. We keep major.minor from version.json visible
+    # and put the build DATE (days since the ROCm 1.0 epoch) in the third field,
+    # so every build outranks the previous one within its major.minor line. The
+    # marketing patch (e.g. 10.2.0) is surfaced separately via the MSI's
+    # ARPDISPLAYVERSION property, not here. Cross-line coexistence (10.2 vs 10.3)
+    # is handled by a per-major.minor UpgradeCode in the generator, so this field
+    # never has to order across lines. All release types share one shape; a
+    # release simply has the highest build field in its line because it is built
+    # last (no further nightlies follow a major.minor's release).
+    elif package_type == "msi":
+        parts = base_version.split(".")
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            raise ValueError(
+                f"base version must be at least major.minor for msi (got "
+                f"{base_version!r})"
+            )
+        major, minor = parts[0], parts[1]
+        build_field = compute_msi_build_field(
+            datetime.strptime(current_date, "%Y%m%d").date()
+        )
+        rocm_package_version = f"{major}.{minor}.{build_field}.0"
+        _log(f"Full version  : '{rocm_package_version}'")
+        return rocm_package_version
+
+    else:
+        raise AssertionError(f"Unexpected package type: {package_type}")
 
 
 def main(argv):
@@ -375,10 +442,13 @@ def main(argv):
         _log("Warning: --build-variant is ignored when --custom-version-suffix is set")
 
     version_data = load_version_file()
+    # Read the date once, so every version and rocm_build_date agree even if
+    # the clock passes midnight while this runs.
+    build_date = get_current_date()
 
-    # Compute versions for all three package types: wheel, deb, and rpm
+    # Compute versions for all package types: wheel, deb, rpm, and msi.
     outputs = {}
-    for pkg_type in ["wheel", "deb", "rpm"]:
+    for pkg_type in ["wheel", "deb", "rpm", "msi"]:
         version = compute_version(
             package_type=pkg_type,
             release_type=args.release_type,
@@ -388,14 +458,18 @@ def main(argv):
             override_base_version=args.override_base_version,
             override_git_sha=args.override_git_sha,
             version_data=version_data,
+            build_date=build_date,
         )
 
         # Set appropriate output variable based on package type
         if pkg_type == "wheel":
             outputs["rocm_package_version"] = version
-        else:  # deb or rpm
+        else:  # deb, rpm, or msi
             outputs[f"rocm_{pkg_type}_package_version"] = version
 
+    # The run's build date, so later jobs can share one date (e.g. the dated
+    # nightly package folders) instead of each reading the clock.
+    outputs["rocm_build_date"] = build_date
     gha_set_output(outputs)
 
 

@@ -4,6 +4,7 @@
 
 """Tests for data invariants in amdgpu_family_matrix.py."""
 
+import json
 import os
 import sys
 import unittest
@@ -101,6 +102,29 @@ class TestFamilyMatrixInvariants(unittest.TestCase):
                 variants = entry[platform].get("build_variants", [])
                 if not variants:
                     self.fail(f"{target_name}/{platform} has empty build_variants")
+
+    def test_build_variants_are_defined_for_platform(self):
+        """Every listed build variant must have an all_build_variants entry."""
+        for target_name, entry in ALL_FAMILIES.items():
+            for platform in ("linux", "windows"):
+                if platform not in entry:
+                    continue
+                defined = amdgpu_family_matrix.all_build_variants.get(platform, {})
+                for variant in entry[platform]["build_variants"]:
+                    self.assertIn(
+                        variant, defined, f"{target_name}/{platform}: {variant}"
+                    )
+
+    def test_build_variant_presets_exist(self):
+        """Every build variant's CMake preset must exist in CMakePresets.json."""
+        presets_path = Path(__file__).parents[3] / "CMakePresets.json"
+        presets = json.loads(presets_path.read_text())
+        preset_names = {p["name"] for p in presets["configurePresets"]}
+        for platform, variants in amdgpu_family_matrix.all_build_variants.items():
+            for name, config in variants.items():
+                preset = config["build_variant_cmake_preset"]
+                if preset:
+                    self.assertIn(preset, preset_names, f"{platform}/{name}")
 
     def test_builds_on_trigger_non_empty(self):
         """Every platform entry must list at least one build trigger."""
@@ -210,6 +234,48 @@ class TestTriggerFiltering(unittest.TestCase):
         # Should include both presubmit-only and nightly-only families
         self.assertIn("gfx94x", all_families)  # presubmit family
         self.assertIn("gfx900", all_families)  # nightly-only family
+
+
+class TestBuildVariantDataFlow(unittest.TestCase):
+    """Tests that build_variants flow through family parsing unchanged."""
+
+    VARIANTS = ["release", "asan-debug", "host-asan"]
+
+    def test_variants_survive_external_runner_overlay(self):
+        """An external runner overlay must not clobber build_variants."""
+        fake_families = {
+            "mock-family": {
+                "linux": {
+                    "test-runs-on": "local-runner",
+                    "family": "mock-family",
+                    "fetch-gfx-targets": ["gfx0000"],
+                    "build_variants": list(self.VARIANTS),
+                    "builds_on_trigger": ["presubmit"],
+                    "tests_on_trigger": ["presubmit"],
+                }
+            }
+        }
+        fake_external = {
+            "runner_labels": {
+                "mock-family": {"linux": {"test-runs-on": "external-runner"}}
+            }
+        }
+        with (
+            mock.patch.object(
+                amdgpu_family_matrix,
+                "_get_local_families_for_trigger_types",
+                return_value=fake_families,
+            ),
+            mock.patch.object(
+                amdgpu_family_matrix,
+                "load_external_runner_config",
+                return_value=fake_external,
+            ),
+        ):
+            result = get_all_families_for_trigger_types(["presubmit"])
+        self.assertEqual(
+            result["mock-family"]["linux"]["build_variants"], self.VARIANTS
+        )
 
 
 class TestExternalConfig(unittest.TestCase):
@@ -392,6 +458,80 @@ class TestExternalConfig(unittest.TestCase):
                 self.assertEqual(runners["family"], "gfx94X-dcgpu")
                 self.assertIn("release", runners["build_variants"])
 
+    def test_onboarding_runners_are_drawn_only_by_listed_repositories(self):
+        """Other callers read the same config, but no manager may watch their jobs."""
+        ossci = {"label": "ossci-1gpu", "count": 9}
+        crusoe = {"label": "crusoe-1gpu", "count": 3}
+        crusoe_8gpu = {"label": "crusoe-8gpu", "count": 4}
+        cases = [
+            (["ROCm/TheRock"], "ROCm/TheRock", True),
+            (["ROCm/TheRock"], "ROCm/rocm-libraries", False),
+            (["ROCm/TheRock"], "ROCm/rockrel", False),
+            (["ROCm/TheRock", "ROCm/rocm-libraries"], "ROCm/rocm-libraries", True),
+            (None, "ROCm/rockrel", True),
+        ]
+        for repositories, repository, drawn in cases:
+            linux = {
+                "test-runs-on": "ossci-1gpu",
+                # Docker CSPs join the shared pool, Apptainer ones their own.
+                "test-runs-on-labels": [ossci, crusoe],
+                "test-runs-on-multi-gpu-apptainer-labels": [crusoe_8gpu],
+            }
+            if repositories is not None:
+                linux["onboarding-runners"] = {
+                    "labels": ["crusoe-1gpu", "crusoe-8gpu"],
+                    "repositories": repositories,
+                }
+            fake_config = {"runner_labels": {"gfx950": {"linux": linux}}}
+            os.environ["GITHUB_REPOSITORY"] = repository
+            with self.subTest(
+                repositories=repositories, repository=repository
+            ), mock.patch.object(
+                amdgpu_family_matrix,
+                "load_external_runner_config",
+                return_value=fake_config,
+            ):
+                runners = get_all_families_for_trigger_types([])["gfx950"]["linux"]
+                if drawn:
+                    self.assertEqual(runners["test-runs-on-labels"], [ossci, crusoe])
+                    self.assertEqual(
+                        runners["test-runs-on-multi-gpu-apptainer-labels"],
+                        [crusoe_8gpu],
+                    )
+                else:
+                    self.assertEqual(runners["test-runs-on-labels"], [ossci])
+                    self.assertNotIn("test-runs-on-multi-gpu-apptainer-labels", runners)
+
+    def test_pool_with_apptainer(self):
+        ossci = [{"label": "ossci-1gpu", "count": 9}]
+        crusoe = [{"label": "crusoe-1gpu", "count": 3}]
+        cases = [
+            ({"test-runs-on-labels": ossci}, ossci),
+            (
+                {
+                    "test-runs-on-labels": ossci,
+                    "test-runs-on-apptainer-labels": crusoe,
+                },
+                ossci + crusoe,
+            ),
+            # Never a pool of Apptainer runners alone.
+            ({"test-runs-on-apptainer-labels": crusoe}, None),
+        ]
+        for runners, expected in cases:
+            with self.subTest(runners=runners):
+                self.assertEqual(
+                    amdgpu_family_matrix.pool_with_apptainer(
+                        runners, "test-runs-on-labels"
+                    ),
+                    expected,
+                )
+        self.assertEqual(
+            amdgpu_family_matrix.pool_with_apptainer(
+                {"test-runs-on-2gpu-labels": ossci}, "test-runs-on-2gpu-labels"
+            ),
+            ossci,
+        )
+
     def test_v1_external_config_extracts_runner_labels(self):
         """V1 config format (gpu_families) is handled for backward compatibility."""
         # V1 format has gpu_families organized by trigger type
@@ -496,14 +636,19 @@ class TestBuildRunnerSelection(unittest.TestCase):
             # (platform, variant, size, expected_runner_label)
             ("linux", "release", "large", "aws-linux-scale-rocm-prod"),
             ("windows", "release", "large", "aws-windows-scale-rocm-prod-mix"),
-            # Sanitizer builds always use the large runner regardless of requested size
-            ("linux", "asan", "small", "aws-linux-scale-rocm-large"),
-            ("linux", "tsan", "medium", "aws-linux-scale-rocm-large"),
+            # Sanitizer large stages use the dedicated sanitizer pool;
+            # small/medium stages fall through to their normal pools
+            ("linux", "asan", "small", "aws-linux-scale-rocm-small"),
+            ("linux", "tsan", "medium", "aws-linux-scale-rocm-medium"),
             ("linux", "release", "small", "aws-linux-scale-rocm-small"),
             # Windows has no small/medium pool — falls back to the Windows default
             ("windows", "release", "small", "aws-windows-scale-rocm-prod-mix"),
             ("linux", "release", "medium", "aws-linux-scale-rocm-medium"),
             ("windows", "release", "medium", "aws-windows-scale-rocm-prod-mix"),
+            # native_package: medium for sanitizer, small otherwise
+            ("linux", "release", "native_package", "aws-linux-scale-rocm-small"),
+            ("linux", "asan", "native_package", "aws-linux-scale-rocm-medium"),
+            ("linux", "tsan", "native_package", "aws-linux-scale-rocm-medium"),
         ]
         with patch("random.SystemRandom.random", return_value=0.5):
             for platform, variant, size, expected in cases:
@@ -512,6 +657,18 @@ class TestBuildRunnerSelection(unittest.TestCase):
                         select_build_runner(platform, variant, size=size),
                         expected,
                     )
+
+    def test_select_build_runner_bump_trigger(self):
+        """submodule_bump trigger falls back to default when no 'bump' pool in local config."""
+        # Local BUILD_RUNNER_LABELS has no "bump" key, so it should fall through to default.
+        with patch("random.SystemRandom.random", return_value=0.5):
+            result = select_build_runner(
+                "linux",
+                "release",
+                size="large",
+                triggers={"presubmit", "submodule_bump"},
+            )
+            self.assertEqual(result, "aws-linux-scale-rocm-prod")
 
 
 class TestDisabledFrameworkTests(unittest.TestCase):
